@@ -237,10 +237,12 @@ settings["modelProviders"]["openai"] = providers
 # Set as default model
 settings["model"] = {"name": "ollama-local"}
 
-# Add global timeout config
-if "contentGenerator" not in settings:
-    settings["contentGenerator"] = {}
-settings["contentGenerator"]["timeout"] = 120000
+# Add timeout to model generationConfig (not deprecated contentGenerator)
+if "model" not in settings:
+    settings["model"] = {}
+if "generationConfig" not in settings["model"]:
+    settings["model"]["generationConfig"] = {}
+settings["model"]["generationConfig"]["timeout"] = 120000
 
 # Add timeout to local model
 for p in providers:
