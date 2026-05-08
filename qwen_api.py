@@ -1,209 +1,162 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
-import httpx
-import uvicorn
-import json
-import re
+#!/usr/bin/env python3
+"""Ollama-to-OpenAI Proxy - Stable stdlib version"""
+import json, logging, sys, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
-app = FastAPI(title="Qwen OpenAI-Compatible API")
+OLLAMA = "http://localhost:11434"
+MODEL_MAP = {"ollama-local": "qwen2.5-coder:14b", "ollama": "qwen2.5-coder:14b"}
 
-OLLAMA_BASE_URL = "http://localhost:11434"
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
+logger = logging.getLogger("proxy")
 
-# Map Qwen Code model IDs to Ollama model names
-MODEL_MAP = {
-    "ollama-local": "qwen2.5-coder:14b",
-    "ollama": "qwen2.5-coder:14b",
-}
+def resolve_model(name):
+    return MODEL_MAP.get(name, name)
 
-def resolve_model(model_name):
-    return MODEL_MAP.get(model_name, model_name)
-
-def transform_to_tool_call(response_json):
-    try:
-        choices = response_json.get("choices", [])
-        if choices and len(choices) > 0:
-            message = choices[0].get("message", {})
-            content = message.get("content", "")
-
-            if not content:
-                return response_json
-
-            # Try parsing entire content as JSON first
-            try:
-                data = json.loads(content.strip())
-                if isinstance(data, dict) and "name" in data and "arguments" in data:
-                    data_list = [data]
-                elif isinstance(data, list):
-                    data_list = data
-                else:
-                    data_list = []
-            except json.JSONDecodeError:
-                data_list = []
-
-            # If direct parse failed, try regex
-            if not data_list:
-                # Try to find JSON blocks in content
-                start = content.find('{')
-                if start != -1:
-                    # Find matching closing brace with balanced depth
-                    depth = 0
-                    end = start
-                    for i, char in enumerate(content[start:], start):
-                        if char == '{':
-                            depth += 1
-                        elif char == '}':
-                            depth -= 1
-                            if depth == 0:
-                                end = i + 1
-                                break
-                    
-                    json_str = content[start:end]
-                    try:
-                        data = json.loads(json_str)
-                        if isinstance(data, dict) and "name" in data and "arguments" in data:
-                            data_list = [data]
-                        elif isinstance(data, list):
-                            data_list = data
-                        else:
-                            data_list = []
-                    except json.JSONDecodeError:
-                        data_list = []
-
-            tool_calls = []
-            for i, call in enumerate(data_list):
-                if isinstance(call, dict) and "name" in call:
-                    arguments = call.get("arguments", call.get("parameters", {}))
-                    if isinstance(arguments, dict):
-                        arguments = json.dumps(arguments)
-                    
-                    tool_calls.append({
-                        "id": f"call_{len(tool_calls)}_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": call["name"],
-                            "arguments": arguments
-                        }
-                    })
-
-            if tool_calls:
-                message["tool_calls"] = tool_calls
-                message["content"] = None
-    except Exception as e:
-        print(f"ERROR in transform_to_tool_call: {e}")
-
-    return response_json
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-    stream = body.get("stream", False)
-
-    if stream:
-        async def stream_generator():
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                try:
-                    # We override stream to False internally so we can transform the full response
-                    internal_body = body.copy()
-                    internal_body["model"] = resolve_model(internal_body["model"])
-                    internal_body["stream"] = False
-                    
-                    body["model"] = resolve_model(body.get("model", "qwen2.5-coder:14b"))
-                    response = await client.post(
-                        f"{OLLAMA_BASE_URL}/v1/chat/completions",
-                        json=internal_body,
-                        headers={"Content-Type": "application/json"}
-                    )
-                    
-                    data = response.json()
-                    data = transform_to_tool_call(data)
-                    
-                    msg_id = data.get("id", "chatcmpl-123")
-                    model = data.get("model", "qwen2.5-coder:14b")
-                    choices = data.get("choices", [])
-                    if not choices or not choices[0].get("message"):
-                        error_msg = data.get("error", "No choices in response")
-                        raise ValueError(f"Ollama error: {error_msg}")
-                    message = choices[0]["message"]
-                    
-                    if message.get("tool_calls"):
-                        # Format tool calls specifically for OpenAI chunk format
-                        # Tool calls need an 'index' in streaming mode
-                        tools_with_index = []
-                        for i, tc in enumerate(message["tool_calls"]):
-                            tc["index"] = i
-                            tools_with_index.append(tc)
-                            
-                        chunk = {
-                            "id": msg_id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "tool_calls": tools_with_index
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                    elif message.get("content"):
-                        # Yield the whole content at once as a single chunk
-                        chunk = {
-                            "id": msg_id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": message["content"]
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        
-                    # Stop chunk
-                    end_chunk = {
-                        "id": msg_id,
-                        "object": "chat.completion.chunk",
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    yield f"data: {json.dumps(end_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-
-                except Exception as e:
-                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    else:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            try:
-                response = await client.post(
-                    f"{OLLAMA_BASE_URL}/v1/chat/completions",
-                    json=body,
-                    headers={"Content-Type": "application/json"}
-                )
-                data = response.json()
-                data = transform_to_tool_call(data)
-                return data
-            except httpx.RequestError as exc:
-                raise HTTPException(status_code=500, detail=f"Error connecting to Ollama: {exc}")
-
-@app.get("/v1/models")
-async def list_models():
-    async with httpx.AsyncClient() as client:
+def extract_tool_calls(content):
+    if not content: return []
+    content = content.strip()
+    if content.startswith('{'):
         try:
-            response = await client.get(f"{OLLAMA_BASE_URL}/v1/models")
-            return response.json()
-        except:
-            return {"object": "list", "data": []}
+            d = json.loads(content, strict=False)
+            if isinstance(d, dict) and "name" in d and "arguments" in d: return [d]
+            if isinstance(d, list): return d
+        except: pass
+    s = content.find('{')
+    if s == -1: return []
+    depth = 0
+    for i, ch in enumerate(content[s:], s):
+        if ch == '{': depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    d = json.loads(content[s:i+1], strict=False)
+                    if isinstance(d, dict) and "name" in d and "arguments" in d: return [d]
+                    if isinstance(d, list): return d
+                except: pass
+                break
+    return []
+
+def transform(data):
+    try:
+        choices = data.get("choices", [])
+        if not choices: return data
+        msg = choices[0].get("message", {})
+        parsed = extract_tool_calls(msg.get("content", ""))
+        if parsed:
+            tc = []
+            for i, c in enumerate(parsed):
+                if isinstance(c, dict) and "name" in c:
+                    args = c.get("arguments", c.get("parameters", {}))
+                    if isinstance(args, dict): args = json.dumps(args)
+                    elif not isinstance(args, str): args = str(args)
+                    tc.append({"id": f"call_{i:04d}", "type": "function", "function": {"name": c["name"], "arguments": args}})
+            if tc:
+                msg["tool_calls"] = tc
+                msg["content"] = None
+    except Exception as e:
+        logger.error(f"Transform error: {e}")
+    return data
+
+def ollama_req(path, body=None):
+    url = f"{OLLAMA}{path}"
+    data = None
+    if body:
+        body = body.copy()
+        body["model"] = resolve_model(body.get("model", "qwen2.5-coder:14b"))
+        data = json.dumps(body).encode("utf-8")
+    req = Request(url, data=data, method="POST" if body else "GET")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(req, timeout=120) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except URLError as e:
+        return 502, {"error": f"Ollama error: {e.reason}"}
+    except Exception as e:
+        return 500, {"error": str(e)}
+
+def send_json(h, status, data):
+    body = json.dumps(data).encode()
+    h.send_response(status)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    h.send_header("Connection", "keep-alive")
+    h.end_headers()
+    h.wfile.write(body)
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): logger.info(fmt % args)
+
+    def do_GET(self):
+        if "/models" in self.path or self.path in ("/health", "/"):
+            st, d = ollama_req("/api/tags")
+            if st == 200:
+                ms = [{"id": m["name"], "object": "model", "created": 0, "owned_by": m.get("details",{}).get("family","?")} for m in d.get("models",[])]
+                send_json(self, 200, {"object": "list", "data": ms})
+            else:
+                send_json(self, 200, {"object": "list", "data": []})
+        else:
+            send_json(self, 404, {"error": "Not found"})
+
+    def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(ln))
+            except Exception as e:
+                send_json(self, 400, {"error": str(e)}); return
+            st, d = ollama_req("/v1/chat/completions", body)
+            if st != 200:
+                send_json(self, st, d); return
+            d = transform(d)
+            if body.get("stream"):
+                self._sse(d)
+            else:
+                send_json(self, 200, d)
+        else:
+            send_json(self, 404, {"error": "Not found"})
+
+    def _sse(self, data):
+        try:
+            mid = data.get("id", "p")
+            model = data.get("model", "m")
+            msg = data["choices"][0]["message"]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            chunks = []
+            if msg.get("tool_calls"):
+                tc = [{"id": f"call_{i}", "type": "function", "function": t["function"], "index": i} for i, t in enumerate(msg["tool_calls"])]
+                chunks.append({"id": mid, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc}, "finish_reason": None}]})
+            elif msg.get("content"):
+                chunks.append({"id": mid, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": msg["content"]}, "finish_reason": None}]})
+            chunks.append({"id": mid, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            for c in chunks:
+                self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+
+class TS(HTTPServer):
+    def process_request(self, req, addr):
+        threading.Thread(target=self._h, args=(req, addr), daemon=True).start()
+    def _h(self, req, addr):
+        try: self.finish_request(req, addr)
+        except: self.handle_error(req, addr)
+        finally: self.shutdown_request(req)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8001
+    model = sys.argv[2] if len(sys.argv) > 2 else None
+    if model: MODEL_MAP["default"] = model
+    s = TS(("0.0.0.0", port), H)
+    print(f"Proxy on port {port}, model: {model or 'client-specified'}", flush=True)
+    try: s.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped."); s.shutdown()
