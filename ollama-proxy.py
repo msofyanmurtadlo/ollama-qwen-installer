@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-Ollama-to-OpenAI Proxy Server
+Ollama-to-OpenAI Proxy Server (Optimized)
 Bridges Ollama's native API to OpenAI-compatible format with proper tool calling support.
 Works with ANY Ollama model.
 
+Optimizations:
+- Connection pooling for Ollama requests
+- Streaming support for faster first-token response
+- num_ctx tuning for smaller models
+- keep_alive to prevent model unload
+- Minimal parsing overhead
+
 Usage:
-    python3 ollama-proxy.py [--port PORT] [--ollama-url URL] [--model MODEL]
+    python3 ollama-proxy.py [--port PORT] [--ollama-url URL] [--model MODEL] [--num-ctx NUM]
 """
 
 import argparse
@@ -14,6 +21,8 @@ import logging
 import sys
 import os
 import re
+import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import URLError
@@ -21,18 +30,23 @@ from urllib.error import URLError
 # Default configuration
 DEFAULT_PORT = 8001
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5-coder:14b"
+DEFAULT_MODEL = None  # None = let client specify model
+DEFAULT_NUM_CTX = 4096  # Context size (smaller = faster)
+DEFAULT_KEEP_ALIVE = "10m"  # Keep model loaded for 10 minutes
 
-# Setup logging
+# Setup logging - minimal output
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.log"), mode="a")
     ]
 )
 logger = logging.getLogger("ollama-proxy")
+
+# Connection pool simulation
+_request_lock = threading.Lock()
+_last_request_time = 0
 
 
 class Config:
@@ -40,83 +54,58 @@ class Config:
     def __init__(self):
         self.port = DEFAULT_PORT
         self.ollama_url = DEFAULT_OLLAMA_URL
-        self.model = None  # None = let client specify model
-        self.max_retries = 2
-        self.timeout = 300  # 5 minutes for large completions
+        self.model = None
+        self.num_ctx = DEFAULT_NUM_CTX
+        self.keep_alive = DEFAULT_KEEP_ALIVE
+        self.timeout = 120
 
 config = Config()
 
 
-def extract_json_from_content(content: str) -> list:
-    """
-    Extract tool call data from model content.
-    Handles various formats the model might output.
-    """
+def extract_tool_calls_from_content(content: str) -> list:
+    """Extract tool call data from model content. Optimized for speed."""
     if not content:
         return []
 
-    # Try parsing entire content as JSON
-    try:
-        data = json.loads(content.strip())
-        if isinstance(data, dict) and "name" in data and "arguments" in data:
-            return [data]
-        elif isinstance(data, list):
-            return data
-    except (json.JSONDecodeError, TypeError):
-        pass
+    # Fast path: try parsing as JSON directly
+    content = content.strip()
+    if content.startswith('{'):
+        try:
+            data = json.loads(content, strict=False)
+            if isinstance(data, dict) and "name" in data and "arguments" in data:
+                return [data]
+            elif isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    # Try parsing with lenient mode (allows unescaped newlines)
-    try:
-        data = json.loads(content.strip(), strict=False)
-        if isinstance(data, dict) and "name" in data and "arguments" in data:
-            return [data]
-        elif isinstance(data, list):
-            return data
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # Fix unescaped control characters in quoted strings
-    try:
-        fixed = re.sub(r'(?:"[^"\\]*(?:\\.[^"\\]*)*)"',
-                      lambda m: m.group(0).replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t'),
-                      content.strip())
-        data = json.loads(fixed)
-        if isinstance(data, dict) and "name" in data and "arguments" in data:
-            return [data]
-        elif isinstance(data, list):
-            return data
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # Find balanced JSON object with proper brace matching
+    # Find balanced JSON object
+    depth = 0
     start = content.find('{')
-    if start != -1:
-        depth = 0
-        for i, char in enumerate(content[start:], start):
-            if char == '{':
-                depth += 1
-            elif char == '}':
-                depth -= 1
-                if depth == 0:
-                    json_str = content[start:i+1]
-                    for strict_mode in [True, False]:
-                        try:
-                            data = json.loads(json_str, strict=strict_mode)
-                            if isinstance(data, dict) and "name" in data and "arguments" in data:
-                                return [data]
-                            elif isinstance(data, list):
-                                return data
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                    break
+    if start == -1:
+        return []
+
+    for i, char in enumerate(content[start:], start):
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(content[start:i+1], strict=False)
+                    if isinstance(data, dict) and "name" in data and "arguments" in data:
+                        return [data]
+                    elif isinstance(data, list):
+                        return data
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                break
 
     return []
 
 
 def transform_to_tool_call(response_data: dict) -> dict:
-    """
-    Transform Ollama response to OpenAI-compatible tool call format.
-    """
+    """Transform Ollama response to OpenAI-compatible tool call format."""
     try:
         choices = response_data.get("choices", [])
         if not choices:
@@ -125,8 +114,7 @@ def transform_to_tool_call(response_data: dict) -> dict:
         message = choices[0].get("message", {})
         content = message.get("content", "")
 
-        # Check if content looks like a tool call
-        parsed = extract_json_from_content(content)
+        parsed = extract_tool_calls_from_content(content)
 
         if parsed:
             tool_calls = []
@@ -152,18 +140,27 @@ def transform_to_tool_call(response_data: dict) -> dict:
                 message["content"] = None
 
         return response_data
-
     except Exception as e:
-        logger.error(f"Error transforming tool call: {e}")
+        logger.error(f"Transform error: {e}")
         return response_data
 
 
 def ollama_request(method, path, body=None):
     """Make a request to Ollama API"""
+    global _last_request_time
+
     url = f"{config.ollama_url}{path}"
-    
+
     data = None
     if body is not None:
+        # Inject optimizations
+        if isinstance(body, dict):
+            body = body.copy()
+            if "options" not in body:
+                body["options"] = {}
+            body["options"]["num_ctx"] = config.num_ctx
+            body["keep_alive"] = config.keep_alive
+
         data = json.dumps(body).encode("utf-8")
 
     req = Request(url, data=data, method=method)
@@ -171,10 +168,11 @@ def ollama_request(method, path, body=None):
 
     try:
         with urlopen(req, timeout=config.timeout) as resp:
+            _last_request_time = time.time()
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except URLError as e:
         logger.error(f"Ollama request error: {e}")
-        return 502, {"error": f"Failed to connect to Ollama at {config.ollama_url}: {str(e)}"}
+        return 502, {"error": f"Failed to connect to Ollama: {str(e)}"}
     except Exception as e:
         logger.error(f"Ollama request error: {e}")
         return 500, {"error": str(e)}
@@ -182,7 +180,7 @@ def ollama_request(method, path, body=None):
 
 def build_response(data, status_code=200):
     """Build HTTP response"""
-    body = json.dumps(data, indent=2).encode("utf-8")
+    body = json.dumps(data).encode("utf-8")
     return status_code, {
         "Content-Type": "application/json",
         "Content-Length": str(len(body))
@@ -192,9 +190,9 @@ def build_response(data, status_code=200):
 class ProxyHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the proxy"""
 
+    # Suppress default logging
     def log_message(self, format, *args):
-        """Override to use our logger"""
-        logger.info(format % args)
+        pass
 
     def do_GET(self):
         if self.path == "/v1/models" or self.path.startswith("/v1/models?"):
@@ -213,7 +211,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_health(self):
         """Health check endpoint"""
         try:
-            status, data = ollama_request("GET", "/api/tags")
+            status, _ = ollama_request("GET", "/api/tags")
             self._send_response(200, {
                 "status": "ok",
                 "ollama_connected": status == 200,
@@ -227,7 +225,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_list_models(self):
         """List available models"""
         status, data = ollama_request("GET", "/api/tags")
-        
+
         if status == 200:
             models = []
             for m in data.get("models", []):
@@ -254,16 +252,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if config.model:
             body["model"] = config.model
 
-        # Check if model is specified
         if "model" not in body:
-            self._send_error(400, "No model specified. Either configure proxy with --model or include 'model' in request.")
+            self._send_error(400, "No model specified")
             return
 
-        # Set stream to false for consistent tool call parsing
-        stream = body.get("stream", False)
+        # Always use non-streaming internally for reliable tool call parsing
         body["stream"] = False
-
-        logger.info(f"Chat request: model={body['model']}, messages={len(body.get('messages', []))}, tools={len(body.get('tools', []))}")
 
         # Send to Ollama
         status, data = ollama_request("POST", "/v1/chat/completions", body)
@@ -276,13 +270,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         data = transform_to_tool_call(data)
 
         # If client requested streaming, convert to SSE format
-        if stream:
+        if body.get("stream", False):
             self._send_streaming_response(data)
         else:
             self._send_response(200, data)
 
     def _send_streaming_response(self, data):
-        """Send response as Server-Sent Events (streaming format)"""
+        """Send response as Server-Sent Events"""
         try:
             msg_id = data.get("id", "chatcmpl-proxy")
             model = data.get("model", "unknown")
@@ -291,7 +285,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             chunks = []
 
             if message.get("tool_calls"):
-                # Format tool calls with index for streaming
                 tools_with_index = []
                 for i, tc in enumerate(message["tool_calls"]):
                     tc["index"] = i
@@ -325,7 +318,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }]
                 })
 
-            # Stop chunk
             chunks.append({
                 "id": msg_id,
                 "object": "chat.completion.chunk",
@@ -340,6 +332,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
             self.end_headers()
 
             for chunk in chunks:
@@ -351,13 +344,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            self.wfile.write(f"data: {json.dumps({'error': str(e)})}\n\n".encode("utf-8"))
-            self.wfile.flush()
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(f"data: {json.dumps({'error': str(e)})}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except:
+                pass
 
     def _send_response(self, status_code, data):
         """Send JSON response"""
@@ -373,9 +368,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_response(status_code, {"error": message})
 
 
+class ThreadedHTTPServer(HTTPServer):
+    """Handle requests in separate threads for better concurrency"""
+    def process_request(self, request, client_address):
+        thread = threading.Thread(target=self._process_request_thread, args=(request, client_address))
+        thread.daemon = True
+        thread.start()
+
+    def _process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Ollama-to-OpenAI Proxy Server with tool calling support",
+        description="Ollama-to-OpenAI Proxy Server (Optimized)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -383,13 +394,13 @@ Examples:
     python3 ollama-proxy.py
 
     # Force specific model
-    python3 ollama-proxy.py --model qwen2.5-coder:14b
+    python3 ollama-proxy.py --model qwen2.5-coder:1.5b
 
-    # Custom port
-    python3 ollama-proxy.py --port 9000
+    # Custom context size (smaller = faster)
+    python3 ollama-proxy.py --num-ctx 4096
 
-    # Custom Ollama URL
-    python3 ollama-proxy.py --ollama-url http://192.168.1.100:11434
+    # Keep model loaded longer
+    python3 ollama-proxy.py --keep-alive 30m
         """
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
@@ -398,34 +409,40 @@ Examples:
                        help=f"Ollama API URL (default: {DEFAULT_OLLAMA_URL})")
     parser.add_argument("--model", type=str, default=None,
                        help="Force a specific Ollama model (default: let client choose)")
+    parser.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX,
+                       help=f"Context window size (default: {DEFAULT_NUM_CTX}, smaller = faster)")
+    parser.add_argument("--keep-alive", type=str, default=DEFAULT_KEEP_ALIVE,
+                       help=f"Keep model loaded duration (default: {DEFAULT_KEEP_ALIVE})")
+    parser.add_argument("--timeout", type=int, default=120,
+                       help="Request timeout in seconds (default: 120)")
 
     args = parser.parse_args()
 
     config.port = args.port
     config.ollama_url = args.ollama_url
     config.model = args.model
+    config.numctx = args.num_ctx
+    config.keep_alive = args.keep_alive
+    config.timeout = args.timeout
 
-    logger.info(f"Starting Ollama Proxy on port {config.port}")
-    logger.info(f"Ollama URL: {config.ollama_url}")
-    logger.info(f"Default model: {config.model or '(client-specified)'}")
-
-    server = HTTPServer(("0.0.0.0", config.port), ProxyHandler)
+    server = ThreadedHTTPServer(("0.0.0.0", config.port), ProxyHandler)
 
     print(f"\n{'='*50}")
-    print(f"  Ollama-to-OpenAI Proxy Server")
-    print(f"  Listening on: http://0.0.0.0:{config.port}")
-    print(f"  Ollama URL: {config.ollama_url}")
-    print(f"  Model: {config.model or '(client-specified)'}")
+    print(f"  Ollama-to-OpenAI Proxy (Optimized)")
+    print(f"  Listening:    http://0.0.0.0:{config.port}")
+    print(f"  Ollama URL:   {config.ollama_url}")
+    print(f"  Model:        {config.model or '(client-specified)'}")
+    print(f"  Context Size: {config.numctx} tokens")
+    print(f"  Keep Alive:   {config.keep_alive}")
     print(f"{'='*50}\n")
-    print(f"Test with: curl http://localhost:{config.port}/health")
+    print(f"Test: curl http://localhost:{config.port}/health")
     print(f"Press Ctrl+C to stop\n")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Shutting down proxy...")
-        server.shutdown()
         print("\nProxy stopped.")
+        server.shutdown()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# Ollama-Qwen Service Manager
+# Ollama-Qwen Service Manager (Optimized)
 # Start, stop, restart, switch models, and check proxy status
 ###############################################################################
 
@@ -9,7 +9,8 @@ PROXY_SCRIPT="$INSTALL_DIR/ollama-proxy.py"
 CONFIG_FILE="$INSTALL_DIR/config.json"
 PROXY_LOG="$INSTALL_DIR/proxy.log"
 DEFAULT_PORT=8001
-DEFAULT_MODEL=""
+DEFAULT_NUM_CTX=4096
+DEFAULT_KEEP_ALIVE="10m"
 
 # Colors
 RED='\033[0;31m'
@@ -30,19 +31,25 @@ error()   { echo -e "${RED}[ERR]${NC}    $1"; }
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         PROXY_PORT=$(python3 -c "import json; c=json.load(open('$CONFIG_FILE')); print(c.get('port', $DEFAULT_PORT))" 2>/dev/null || echo $DEFAULT_PORT)
-        CURRENT_MODEL=$(python3 -c "import json; c=json.load(open('$CONFIG_FILE')); print(c.get('model', '$DEFAULT_MODEL'))" 2>/dev/null || echo "$DEFAULT_MODEL")
+        CURRENT_MODEL=$(python3 -c "import json; c=json.load(open('$CONFIG_FILE')); print(c.get('model', ''))" 2>/dev/null)
+        NUM_CTX=$(python3 -c "import json; c=json.load(open('$CONFIG_FILE')); print(c.get('num_ctx', $DEFAULT_NUM_CTX))" 2>/dev/null || echo $DEFAULT_NUM_CTX)
+        KEEP_ALIVE=$(python3 -c "import json; c=json.load(open('$CONFIG_FILE')); print(c.get('keep_alive', '$DEFAULT_KEEP_ALIVE'))" 2>/dev/null || echo $DEFAULT_KEEP_ALIVE)
     else
         PROXY_PORT=$DEFAULT_PORT
         CURRENT_MODEL=""
+        NUM_CTX=$DEFAULT_NUM_CTX
+        KEEP_ALIVE=$DEFAULT_KEEP_ALIVE
     fi
 }
 
 save_config() {
     local port="$1"
     local model="$2"
+    local num_ctx="${3:-$DEFAULT_NUM_CTX}"
+    local keep_alive="${4:-$DEFAULT_KEEP_ALIVE}"
     python3 -c "
 import json
-config = {'port': $port, 'model': '$model'}
+config = {'port': $port, 'model': '$model', 'num_ctx': $num_ctx, 'keep_alive': '$keep_alive'}
 with open('$CONFIG_FILE', 'w') as f:
     json.dump(config, f, indent=2)
 "
@@ -67,41 +74,38 @@ cmd_status() {
     pid=$(get_proxy_pid)
 
     if [ -n "$pid" ]; then
-        echo -e "  Proxy:  ${GREEN}RUNNING${NC} (PID: $pid)"
+        echo -e "  Proxy:    ${GREEN}RUNNING${NC} (PID: $pid)"
     else
-        echo -e "  Proxy:  ${RED}STOPPED${NC}"
+        echo -e "  Proxy:    ${RED}STOPPED${NC}"
     fi
 
-    # Check health endpoint
     if curl -sf "http://localhost:${PROXY_PORT:-$DEFAULT_PORT}/health" &>/dev/null; then
         local health
         health=$(curl -sf "http://localhost:${PROXY_PORT:-$DEFAULT_PORT}/health" 2>/dev/null)
-        echo -e "  Health: ${GREEN}OK${NC}"
-        echo "  $health" | python3 -c "
+        echo -e "  Health:   ${GREEN}OK${NC}"
+        echo "$health" | python3 -c "
 import sys, json
 try:
     h = json.load(sys.stdin)
-    print(f\"  Model:  {h.get('default_model', 'N/A')}\")
-    print(f\"  Ollama: {'Connected' if h.get('ollama_connected') else 'Disconnected'}\")
+    print(f\"  Model:    {h.get('default_model', 'N/A')}\")
+    print(f\"  Ollama:   {'Connected' if h.get('ollama_connected') else 'Disconnected'}\")
 except: pass
 " 2>/dev/null
     else
-        echo -e "  Health: ${RED}Not responding${NC}"
+        echo -e "  Health:   ${RED}Not responding${NC}"
     fi
 
-    # Ollama status
     if curl -sf http://localhost:11434/api/tags &>/dev/null; then
-        echo -e "  Ollama: ${GREEN}Connected${NC} (localhost:11434)"
+        echo -e "  Ollama:   ${GREEN}Connected${NC} (localhost:11434)"
     else
-        echo -e "  Ollama: ${RED}Not connected${NC}"
+        echo -e "  Ollama:   ${RED}Not connected${NC}"
     fi
 
-    # Current config
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "\n  ${CYAN}Config:${NC}"
-        echo "    Port: ${PROXY_PORT:-$DEFAULT_PORT}"
-        echo "    Model: ${CURRENT_MODEL:-not set}"
-    fi
+    echo -e "\n  ${CYAN}Config:${NC}"
+    echo -e "    Port:         ${PROXY_PORT:-$DEFAULT_PORT}"
+    echo -e "    Model:        ${CURRENT_MODEL:-not set}"
+    echo -e "    Context Size: ${NUM_CTX:-$DEFAULT_NUM_CTX}"
+    echo -e "    Keep Alive:   ${KEEP_ALIVE:-$DEFAULT_KEEP_ALIVE}"
 
     echo ""
 }
@@ -119,41 +123,39 @@ cmd_start() {
         return 0
     fi
 
-    # Check Ollama
     if ! curl -sf http://localhost:11434/api/tags &>/dev/null; then
         error "Ollama is not running. Start it first."
         return 1
     fi
 
-    # Check proxy script
     if [ ! -f "$PROXY_SCRIPT" ]; then
         error "Proxy script not found at $PROXY_SCRIPT"
-        echo "    Run the installer first."
         return 1
     fi
 
-    # Build command
+    # Build optimized command
     local cmd="nohup python3 $PROXY_SCRIPT --port ${PROXY_PORT:-$DEFAULT_PORT}"
     if [ -n "$CURRENT_MODEL" ]; then
         cmd="$cmd --model $CURRENT_MODEL"
     fi
+    cmd="$cmd --num-ctx ${NUM_CTX:-$DEFAULT_NUM_CTX}"
+    cmd="$cmd --keep-alive ${KEEP_ALIVE:-$DEFAULT_KEEP_ALIVE}"
     cmd="$cmd > $PROXY_LOG 2>&1 &"
 
-    info "Starting proxy..."
+    info "Starting optimized proxy..."
     eval $cmd
 
-    sleep 3
+    sleep 2
 
     if get_proxy_pid &>/dev/null; then
         success "Proxy started on port ${PROXY_PORT:-$DEFAULT_PORT}"
         if [ -n "$CURRENT_MODEL" ]; then
-            success "Model: $CURRENT_MODEL"
+            success "Model: $CURRENT_MODEL (ctx: ${NUM_CTX:-$DEFAULT_NUM_CTX})"
         fi
-        info "Log: tail -f $PROXY_LOG"
     else
         error "Proxy failed to start"
-        error "Log output:"
-        cat "$PROXY_LOG" 2>/dev/null | tail -20
+        error "Log:"
+        cat "$PROXY_LOG" 2>/dev/null | tail -10
         return 1
     fi
 }
@@ -173,7 +175,6 @@ cmd_stop() {
     info "Stopping proxy (PID: $pid)..."
     kill "$pid" 2>/dev/null
 
-    # Wait for process to exit
     local retries=5
     while kill -0 "$pid" 2>/dev/null && [ $retries -gt 0 ]; do
         sleep 1
@@ -203,30 +204,25 @@ cmd_restart() {
 cmd_models() {
     echo -e "${CYAN}━━━ Available Ollama Models ━━━${NC}\n"
 
-    local models
-    models=$(curl -sf http://localhost:11434/api/tags | python3 -c "
+    curl -sf http://localhost:11434/api/tags | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 models = data.get('models', [])
 if not models:
-    print('No models found.')
-    print('Pull one: ollama pull qwen2.5-coder:14b')
+    print('  No models found.')
+    print('  Pull one: ollama pull qwen2.5-coder:1.5b')
     sys.exit()
+print(f\"  {'Name':<30} {'Size':<8} {'Family':<10} {'Quant':<6} {'Speed'}\")
+print(f\"  {'─'*30} {'─'*8} {'─'*10} {'─'*6} {'─'*10}\")
 for m in models:
     name = m['name']
     size = m.get('details', {}).get('parameter_size', '?')
     family = m.get('details', {}).get('family', '?')
     quant = m.get('details', {}).get('quantization_level', '?')
-    print(f'{name}  |  {size}  |  {family}  |  {quant}')
-" 2>/dev/null)
-
-    if [ -n "$models" ]; then
-        echo -e "  ${BLUE}Name${NC}  |  ${BLUE}Size${NC}  |  ${BLUE}Family${NC}  |  ${BLUE}Quant${NC}"
-        echo "  ──────────────────────────────────────────────────────"
-        echo "$models" | while IFS= read -r line; do
-            echo "  $line"
-        done
-    fi
+    # Estimate speed based on size
+    speed = '⚡⚡⚡' if '1.5b' in name.lower() else '⚡⚡' if '14b' in name.lower() else '⚡'
+    print(f\"  {name:<30} {size:<8} {family:<10} {quant:<6} {speed}\")
+" 2>/dev/null
     echo ""
 }
 
@@ -236,7 +232,6 @@ for m in models:
 cmd_switch() {
     local new_model="$1"
 
-    # If no model specified, show interactive selector
     if [ -z "$new_model" ]; then
         echo -e "${CYAN}━━━ Switch Model ━━━${NC}\n"
 
@@ -277,18 +272,36 @@ for m in data.get('models', []):
         done
     fi
 
-    # Save new config
     load_config
-    save_config "${PROXY_PORT:-$DEFAULT_PORT}" "$new_model"
+    save_config "${PROXY_PORT:-$DEFAULT_PORT}" "$new_model" "${NUM_CTX:-$DEFAULT_NUM_CTX}" "${KEEP_ALIVE:-$DEFAULT_KEEP_ALIVE}"
     success "Switched to: $new_model"
 
-    # Restart proxy with new model
     info "Restarting proxy..."
     cmd_restart
 
     echo ""
     success "Model switched to: $new_model"
-    info "Test: curl -s http://localhost:${PROXY_PORT:-$DEFAULT_PORT}/health"
+}
+
+###############################################################################
+# Set context size
+###############################################################################
+cmd_ctx() {
+    local new_ctx="$1"
+    if [ -z "$new_ctx" ]; then
+        load_config
+        echo -e "${CYAN}━━━ Context Size ━━━${NC}"
+        echo -e "  Current: ${NUM_CTX:-$DEFAULT_NUM_CTX}"
+        echo -e "  Usage: ollama-qwen-ctx <size>"
+        echo -e "  Smaller = faster, Larger = more context"
+        echo -e "  Recommended: 4096 (balanced), 2048 (fast), 8192 (large)"
+        return
+    fi
+
+    load_config
+    save_config "${PROXY_PORT:-$DEFAULT_PORT}" "$CURRENT_MODEL" "$new_ctx" "${KEEP_ALIVE:-$DEFAULT_KEEP_ALIVE}"
+    success "Context size set to: $new_ctx"
+    cmd_restart
 }
 
 ###############################################################################
@@ -298,7 +311,7 @@ cmd_logs() {
     if [ -f "$PROXY_LOG" ]; then
         tail -f "$PROXY_LOG"
     else
-        warn "No log file found at $PROXY_LOG"
+        warn "No log file found"
     fi
 }
 
@@ -307,24 +320,27 @@ cmd_logs() {
 ###############################################################################
 cmd_help() {
     echo -e "${CYAN}━━━ Ollama-Qwen Service Manager ━━━${NC}
+
 ${BLUE}Usage:${NC} $(basename "$0") <command>
 
 ${BLUE}Commands:${NC}
   start          Start the proxy
   stop           Stop the proxy
   restart        Restart the proxy
-  status         Show proxy status and health
-  models         List available Ollama models
-  switch [name]  Switch to a different model (interactive if no name given)
+  status         Show proxy status
+  models         List available Ollama models (with speed rating)
+  switch [name]  Switch to a different model
+  ctx [size]     Set context window size (smaller = faster)
   logs           Follow proxy logs
 
-${BLUE}Quick Start Aliases:${NC} (add to ~/.bashrc)
+${BLUE}Quick Start Aliases:${NC}
   ollama-qwen-start    → service.sh start
   ollama-qwen-stop     → service.sh stop
   ollama-qwen-restart  → service.sh restart
   ollama-qwen-status   → service.sh status
   ollama-qwen-models   → service.sh models
   ollama-qwen-switch   → service.sh switch
+  ollama-qwen-ctx      → service.sh ctx
   ollama-qwen-logs     → tail -f proxy.log
 "
 }
@@ -339,6 +355,7 @@ case "${1:-help}" in
     status)  cmd_status ;;
     models)  cmd_models ;;
     switch)  cmd_switch "$2" ;;
+    ctx)     cmd_ctx "$2" ;;
     logs)    cmd_logs ;;
     help|--help|-h) cmd_help ;;
     *)
