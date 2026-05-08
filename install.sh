@@ -237,6 +237,24 @@ settings["modelProviders"]["openai"] = providers
 # Set as default model
 settings["model"] = {"name": "ollama-local"}
 
+# Add global timeout config
+if "contentGenerator" not in settings:
+    settings["contentGenerator"] = {}
+settings["contentGenerator"]["timeout"] = 120000
+
+# Add timeout to local model
+for p in providers:
+    if p.get("id") == "ollama-local":
+        if "generationConfig" not in p:
+            p["generationConfig"] = {}
+        p["generationConfig"]["timeout"] = 120000
+        break
+
+# Add OLLAMA_API_KEY to env if not present
+if "env" not in settings:
+    settings["env"] = {}
+settings["env"]["OLLAMA_API_KEY"] = "ollama"
+
 with open(settings_path, 'w') as f:
     json.dump(settings, f, indent=2)
 PYEOF
@@ -349,7 +367,16 @@ setup_aliases() {
 
     BASHRC="$HOME/.bashrc"
 
-    # Add alias if not already present
+    # Create .env file for persistent config
+    QWEN_ENV="$HOME/.qwen/.env"
+    mkdir -p "$(dirname "$QWEN_ENV")"
+    cat > "$QWEN_ENV" << 'EOF'
+OLLAMA_API_KEY=ollama
+EOF
+    chmod 600 "$QWEN_ENV"
+    success "Created Qwen .env file"
+
+    # Add env var and aliases if not already present
     if ! grep -q "OLLAMA_API_KEY" "$BASHRC" 2>/dev/null; then
         cat << 'ALIASES' >> "$BASHRC"
 
