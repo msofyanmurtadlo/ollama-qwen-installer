@@ -350,10 +350,11 @@ setup_aliases() {
     BASHRC="$HOME/.bashrc"
 
     # Add alias if not already present
-    if ! grep -q "ollama-qwen-start" "$BASHRC" 2>/dev/null; then
+    if ! grep -q "OLLAMA_API_KEY" "$BASHRC" 2>/dev/null; then
         cat << 'ALIASES' >> "$BASHRC"
 
 # === Ollama-Qwen Proxy Quick Start ===
+export OLLAMA_API_KEY="ollama"
 alias ollama-qwen-start='bash ~/.ollama-qwen/service.sh start'
 alias ollama-qwen-stop='bash ~/.ollama-qwen/service.sh stop'
 alias ollama-qwen-restart='bash ~/.ollama-qwen/service.sh restart'
@@ -363,7 +364,7 @@ alias ollama-qwen-switch='bash ~/.ollama-qwen/service.sh switch'
 alias ollama-qwen-logs='tail -f ~/.ollama-qwen/proxy.log'
 # === End Ollama-Qwen ===
 ALIASES
-        success "Added quick-start aliases to ~/.bashrc"
+        success "Added OLLAMA_API_KEY and quick-start aliases to ~/.bashrc"
         info "Run 'source ~/.bashrc' or restart terminal to use"
     else
         info "Aliases already configured"
