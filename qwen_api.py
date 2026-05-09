@@ -12,6 +12,11 @@ logger = logging.getLogger("proxy")
 def resolve_model(name):
     return MODEL_MAP.get(name, name)
 
+# Tools to NOT transform from content JSON to tool_calls.
+# These are interactive tools that Qwen Code handles differently.
+# Let the model output them as content instead of triggering tool execution.
+SKIP_TOOLS = {"ask_user_question", "todo_write", "exit_plan_mode"}
+
 def extract_tool_call(content):
     if not content: return None
     content = content.strip()
@@ -19,6 +24,9 @@ def extract_tool_call(content):
         try:
             d = json.loads(content, strict=False)
             if isinstance(d, dict) and "name" in d and "arguments" in d:
+                # Skip interactive tools - let them render as content
+                if d["name"] in SKIP_TOOLS:
+                    return None
                 args = d["arguments"]
                 if isinstance(args, dict): args = json.dumps(args)
                 return {"id": "call_0000", "type": "function", "function": {"name": d["name"], "arguments": args}}
