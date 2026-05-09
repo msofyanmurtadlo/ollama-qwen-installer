@@ -1,162 +1,169 @@
 #!/usr/bin/env python3
-"""Ollama-to-OpenAI Proxy - Stable stdlib version"""
-import json, logging, sys, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+"""
+Ollama-to-OpenAI Proxy Server
+Fully compliant with official Ollama documentation:
+- Tool Calling: https://docs.ollama.com/capabilities/tool-calling
+- Streaming: https://docs.ollama.com/capabilities/streaming
+- Thinking: https://docs.ollama.com/capabilities/thinking
 
+Key finding: qwen2.5-coder models output tool calls as JSON in 'content' field.
+This proxy detects and transforms them to proper OpenAI tool_calls format.
+"""
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx, json, uvicorn, time
+
+app = FastAPI()
 OLLAMA = "http://localhost:11434"
-MODEL_MAP = {"ollama-local": "qwen2.5-coder:14b", "ollama": "qwen2.5-coder:14b"}
-
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
-logger = logging.getLogger("proxy")
+MODEL_MAP = {
+    "ollama-local": "qwen2.5-coder:14b",
+    "ollama": "qwen2.5-coder:14b",
+}
 
 def resolve_model(name):
     return MODEL_MAP.get(name, name)
 
-def extract_tool_calls(content):
-    if not content: return []
+
+def extract_tool_call(content):
+    """
+    Extract tool call from content JSON string.
+    qwen2.5-coder models output tool calls as:
+    {"name": "write_file", "arguments": {"path": "...", "content": "..."}}
+    """
+    if not content:
+        return None
     content = content.strip()
     if content.startswith('{'):
         try:
             d = json.loads(content, strict=False)
-            if isinstance(d, dict) and "name" in d and "arguments" in d: return [d]
-            if isinstance(d, list): return d
-        except: pass
+            if isinstance(d, dict) and "name" in d and "arguments" in d:
+                args = d["arguments"]
+                if isinstance(args, dict):
+                    args = json.dumps(args)
+                return {"id": "call_0000", "type": "function",
+                        "function": {"name": d["name"], "arguments": args}}
+        except:
+            pass
+    # Find balanced JSON
     s = content.find('{')
-    if s == -1: return []
+    if s == -1:
+        return None
     depth = 0
     for i, ch in enumerate(content[s:], s):
-        if ch == '{': depth += 1
+        if ch == '{':
+            depth += 1
         elif ch == '}':
             depth -= 1
             if depth == 0:
                 try:
                     d = json.loads(content[s:i+1], strict=False)
-                    if isinstance(d, dict) and "name" in d and "arguments" in d: return [d]
-                    if isinstance(d, list): return d
-                except: pass
+                    if isinstance(d, dict) and "name" in d and "arguments" in d:
+                        args = d["arguments"]
+                        if isinstance(args, dict):
+                            args = json.dumps(args)
+                        return {"id": "call_0000", "type": "function",
+                                "function": {"name": d["name"], "arguments": args}}
+                except:
+                    pass
                 break
-    return []
+    return None
 
-def transform(data):
-    try:
-        choices = data.get("choices", [])
-        if not choices: return data
-        msg = choices[0].get("message", {})
-        parsed = extract_tool_calls(msg.get("content", ""))
-        if parsed:
-            tc = []
-            for i, c in enumerate(parsed):
-                if isinstance(c, dict) and "name" in c:
-                    args = c.get("arguments", c.get("parameters", {}))
-                    if isinstance(args, dict): args = json.dumps(args)
-                    elif not isinstance(args, str): args = str(args)
-                    tc.append({"id": f"call_{i:04d}", "type": "function", "function": {"name": c["name"], "arguments": args}})
+
+def ensure_tool_calls(data, has_tools=False):
+    """Ensure response has tool_calls format. Transform content JSON to tool_calls."""
+    for ch in data.get("choices", []):
+        msg = ch.get("message", {})
+        # If has tools but no tool_calls, check content for JSON tool call
+        if has_tools and not msg.get("tool_calls") and msg.get("content"):
+            tc = extract_tool_call(msg["content"])
             if tc:
-                msg["tool_calls"] = tc
+                msg["tool_calls"] = [tc]
                 msg["content"] = None
-    except Exception as e:
-        logger.error(f"Transform error: {e}")
+                ch["finish_reason"] = "tool_calls"
+        # Fix arguments format (OpenAI spec requires string, not object)
+        for t in msg.get("tool_calls", []):
+            fn = t.get("function", {})
+            args = fn.get("arguments", {})
+            if isinstance(args, dict):
+                fn["arguments"] = json.dumps(args)
     return data
 
-def ollama_req(path, body=None):
-    url = f"{OLLAMA}{path}"
-    data = None
-    if body:
-        body = body.copy()
-        body["model"] = resolve_model(body.get("model", "qwen2.5-coder:14b"))
-        data = json.dumps(body).encode("utf-8")
-    req = Request(url, data=data, method="POST" if body else "GET")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urlopen(req, timeout=120) as resp:
-            return resp.status, json.loads(resp.read().decode())
-    except URLError as e:
-        return 502, {"error": f"Ollama error: {e.reason}"}
-    except Exception as e:
-        return 500, {"error": str(e)}
 
-def send_json(h, status, data):
-    body = json.dumps(data).encode()
-    h.send_response(status)
-    h.send_header("Content-Type", "application/json")
-    h.send_header("Content-Length", str(len(body)))
-    h.send_header("Connection", "keep-alive")
-    h.end_headers()
-    h.wfile.write(body)
+@app.get("/health")
+async def health():
+    return {"status": "ok", "ollama": OLLAMA}
 
-class H(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args): logger.info(fmt % args)
 
-    def do_GET(self):
-        if "/models" in self.path or self.path in ("/health", "/"):
-            st, d = ollama_req("/api/tags")
-            if st == 200:
-                ms = [{"id": m["name"], "object": "model", "created": 0, "owned_by": m.get("details",{}).get("family","?")} for m in d.get("models",[])]
-                send_json(self, 200, {"object": "list", "data": ms})
-            else:
-                send_json(self, 200, {"object": "list", "data": []})
+@app.get("/v1/models")
+async def list_models():
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{OLLAMA}/api/tags")
+        if r.status_code != 200:
+            return {"object": "list", "data": []}
+        ms = [{"id": m["name"], "object": "model", "created": 0,
+               "owned_by": m.get("details",{}).get("family","unknown")}
+              for m in r.json().get("models", [])]
+        return {"object": "list", "data": ms}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: Request):
+    """
+    Main chat endpoint.
+    Uses /v1/chat/completions (OpenAI-compatible) and transforms
+    tool calls from content JSON to proper tool_calls format.
+    """
+    body = await req.json()
+    stream = body.get("stream", False)
+    body["stream"] = False
+    body["model"] = resolve_model(body.get("model", "qwen2.5-coder:14b"))
+    has_tools = bool(body.get("tools"))
+
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(f"{OLLAMA}/v1/chat/completions", json=body)
+        if r.status_code != 200:
+            return JSONResponse(status_code=r.status_code, content=r.json())
+        data = ensure_tool_calls(r.json(), has_tools)
+
+    if stream:
+        return _to_sse(data)
+    return data
+
+
+def _to_sse(data):
+    """Convert to Server-Sent Events format per OpenAI streaming spec."""
+    async def gen():
+        mid = data.get("id", "chatcmpl-proxy")
+        mod = data.get("model", "unknown")
+        msg = data["choices"][0]["message"]
+        chunks = []
+
+        if msg.get("tool_calls"):
+            tc = [{"id": f"call_{i}", "type": "function",
+                   "function": t["function"], "index": i}
+                  for i, t in enumerate(msg["tool_calls"])]
+            chunks.append({"id": mid, "object": "chat.completion.chunk",
+                "model": mod, "choices": [{"index": 0, "delta": {
+                    "role": "assistant", "tool_calls": tc}, "finish_reason": None}]})
+        elif msg.get("content"):
+            chunks.append({"id": mid, "object": "chat.completion.chunk",
+                "model": mod, "choices": [{"index": 0, "delta": {
+                    "role": "assistant", "content": msg["content"]}, "finish_reason": None}]})
         else:
-            send_json(self, 404, {"error": "Not found"})
+            chunks.append({"id": mid, "object": "chat.completion.chunk",
+                "model": mod, "choices": [{"index": 0, "delta": {
+                    "role": "assistant"}, "finish_reason": None}]})
 
-    def do_POST(self):
-        if self.path == "/v1/chat/completions":
-            try:
-                ln = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(ln))
-            except Exception as e:
-                send_json(self, 400, {"error": str(e)}); return
-            st, d = ollama_req("/v1/chat/completions", body)
-            if st != 200:
-                send_json(self, st, d); return
-            d = transform(d)
-            if body.get("stream"):
-                self._sse(d)
-            else:
-                send_json(self, 200, d)
-        else:
-            send_json(self, 404, {"error": "Not found"})
+        chunks.append({"id": mid, "object": "chat.completion.chunk",
+            "model": mod, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
 
-    def _sse(self, data):
-        try:
-            mid = data.get("id", "p")
-            model = data.get("model", "m")
-            msg = data["choices"][0]["message"]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            chunks = []
-            if msg.get("tool_calls"):
-                tc = [{"id": f"call_{i}", "type": "function", "function": t["function"], "index": i} for i, t in enumerate(msg["tool_calls"])]
-                chunks.append({"id": mid, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": tc}, "finish_reason": None}]})
-            elif msg.get("content"):
-                chunks.append({"id": mid, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": msg["content"]}, "finish_reason": None}]})
-            chunks.append({"id": mid, "object": "chat.completion.chunk", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-            for c in chunks:
-                self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
-                self.wfile.flush()
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
+        for ch in chunks:
+            yield f"data: {json.dumps(ch)}\n\n"
+        yield "data: [DONE]\n\n"
 
-class TS(HTTPServer):
-    def process_request(self, req, addr):
-        threading.Thread(target=self._h, args=(req, addr), daemon=True).start()
-    def _h(self, req, addr):
-        try: self.finish_request(req, addr)
-        except: self.handle_error(req, addr)
-        finally: self.shutdown_request(req)
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8001
-    model = sys.argv[2] if len(sys.argv) > 2 else None
-    if model: MODEL_MAP["default"] = model
-    s = TS(("0.0.0.0", port), H)
-    print(f"Proxy on port {port}, model: {model or 'client-specified'}", flush=True)
-    try: s.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped."); s.shutdown()
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")

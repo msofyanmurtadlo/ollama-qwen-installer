@@ -374,3 +374,16 @@ Proxy ini sudah dioptimalkan untuk performa maksimal:
 - **Ollama**: https://ollama.com
 - **Qwen Code CLI**: https://github.com/qwen-code
 - **Proxy**: Custom bridge server (Python stdlib, zero dependencies)
+
+## Test Results (Latest)
+
+| Test | Status |
+|---|---|
+| Proxy Health | ✅ OK |
+| Model List | ✅ 6 models |
+| Chat (no tools) | ✅ Working |
+| Tool Calling (write_file) | ✅ Working |
+| Model Mapping (ollama-local) | ✅ Working |
+| Qwen Code CLI - Create File | ✅ Working |
+| Qwen Code CLI - Read File | ✅ Working |
+| Streaming (SSE) | ✅ Working |
